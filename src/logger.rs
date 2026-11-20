@@ -16,12 +16,13 @@ pub fn set_dir(dir: &std::path::Path) {
 pub fn log(msg: &str) {
     let guard = LOG_PATH.lock().unwrap();
     let Some(path) = guard.as_ref() else { return };
-    let secs = SystemTime::now()
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
+    let tid = std::thread::current().id();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "[{secs}] {msg}");
+        let _ = writeln!(f, "[{}.{:03}] [{tid:?}] {msg}", ms / 1000, ms % 1000);
     }
 }
 

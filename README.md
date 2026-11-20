@@ -56,12 +56,15 @@ Add more by extending `VOICES` in `src/bin/setup/registry.rs` ([all voices](http
 ## How it works
 
 - `src/lib.rs` — COM server exports (`DllGetClassObject`) + class factory.
-- `src/engine.rs` — `ISpTTSEngine`/`ISpObjectWithToken`. Walks the SAPI fragment list, splits sentences, applies rate (−10..10 → 0.5×..2×) and volume from the site, writes PCM, and queues `SPEI_WORD_BOUNDARY` events with audio offsets estimated proportionally per word — that's what drives word highlighting in readers.
+- `src/engine.rs` — `ISpTTSEngine`/`ISpObjectWithToken`. Walks the SAPI fragment list, splits it into chunks (sentences, plus clause breaks for long sentences and for the first chunk of each call, which is what the listener waits on), applies rate (−10..10 → 0.5×..2×) and volume from the site, writes PCM, and queues `SPEI_WORD_BOUNDARY` events with audio offsets estimated proportionally per word — that's what drives word highlighting in readers.
+- Speak is a two-stage pipeline: a worker thread synthesizes chunk N+1 while chunk N plays. The model is loaded once per process (in the background as soon as a voice is selected) and shared by every engine instance. Kokoro's ~300 ms leading pad is trimmed from each chunk, and its trailing pad too at clause splits.
+- Inference threads are exempt from Windows power throttling (EcoQoS). On battery it halves inference speed (measured RTF ~1.1 vs ~0.5 on a 4-core laptop), which turns every chunk boundary into a stall.
 - Writes are paced to real-time plus a ~250 ms lead: `ISpVoice::Pause` doesn't stop the audio device, it only blocks the engine's writes while everything already buffered plays out — so the lead is effectively the pause delay. Abort/purge (Chrome's stop, and its play-after-pause) is honored within ~100 ms.
 - `src/synth.rs` — the Kokoro pipeline (phonemes → token ids → style vector → ONNX → f32 samples).
 - `src/g2p.rs` — `espeak-ng.dll` via `libloading`. Kokoro's training G2P (misaki) falls back to espeak, so espeak IPA output is in-distribution.
 - Config travels through the registry voice token (`VoiceName`, `AssetsDir`); the engine receives it via `SetObjectToken`.
-- Diagnostics: `%LOCALAPPDATA%\KokoroSapi\engine.log` (the DLL runs inside the host app, so there's no console).
+- Diagnostics: `%LOCALAPPDATA%\KokoroSapi\engine.log` (the DLL runs inside the host app, so there's no console). It logs model load time, per-chunk synthesis time and real-time factor, time to first audio, the gap between Speak calls, and `UNDERRUN` lines whenever playback ran dry waiting for synthesis.
+- Benchmarks: `cargo run --release --example bench` (raw synthesis speed) and `cargo run --release --example sapi_bench [TOKEN] [per-sentence]` (end to end through SAPI, muted).
 
 ## Gotchas
 
@@ -70,7 +73,7 @@ Add more by extending `VOICES` in `src/bin/setup/registry.rs` ([all voices](http
 
 ## Known limitations / roadmap
 
-- **Latency**: synthesis is per-sentence; the first audio arrives after the first sentence is done (~real-time on CPU). Streaming in smaller chunks would improve start latency.
+- **Latency**: the first audio of a Speak call waits for its first chunk (~1 s on a laptop CPU). Hosts that issue one Speak per sentence get a small extra pause between sentences: SAPI only hands over the next sentence once the current call returns, and its audio buffer (~500 ms) caps how far ahead a call can finish. The last chunk of each call is written with a larger lead (`TailLeadMs` token value, default 1500) to make the most of that.
 - **Word boundaries are estimated** (proportional to character position). Good enough for highlighting; exact timing would need per-token durations from the model. Note Chrome's reading mode *resumes from the last boundary* after a pause (it purges and re-speaks the remainder rather than calling resume), so boundary drift shows up as a repeated/skipped word on resume.
 - **`SPVES_SKIP` is ignored** — sentence-skip navigation in some readers won't jump.
 - **Commas don't influence prosody** (espeak's `TextToPhonemes` drops mid-sentence punctuation; only the sentence terminator is re-appended).

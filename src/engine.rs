@@ -2,10 +2,19 @@
 //!
 //! SAPI calls `SetObjectToken` right after creation (the token is the registry
 //! voice entry, carrying our config), then `GetOutputFormat` and `Speak`.
+//!
+//! Speak runs a two-stage pipeline: a worker thread synthesizes chunk N+1
+//! while this (SAPI) thread paces chunk N out to the audio device. Synthesis
+//! runs at roughly real time on a laptop CPU, so without the overlap every
+//! chunk boundary is an audible pause.
 
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -31,8 +40,13 @@ const SPVES_VOLUME: u32 = 8;
 struct EngineState {
     token: Option<ISpObjectToken>,
     voice: String,
-    synth: Option<Synth>,
-    synth_failed: bool,
+    assets: PathBuf,
+    tail_lead: Duration,
+    /// When the previous Speak returned, and how much of its audio was still
+    /// queued then (None after an abort). Shows how the host feeds text (one
+    /// call per paragraph vs. per sentence) and whether the next call's first
+    /// audio arrives before that queue runs dry.
+    last_speak_end: Option<(Instant, Option<Duration>)>,
 }
 
 // Safety: SAPI may call the engine from different threads (ThreadingModel=Both),
@@ -50,8 +64,9 @@ impl KokoroEngine {
             state: Mutex::new(EngineState {
                 token: None,
                 voice: "af_heart".into(),
-                synth: None,
-                synth_failed: false,
+                assets: crate::config::assets_dir(None),
+                tail_lead: Duration::from_millis(DEFAULT_TAIL_LEAD_MS as u64),
+                last_speak_end: None,
             }),
         }
     }
@@ -79,8 +94,25 @@ impl ISpObjectWithToken_Impl for KokoroEngine_Impl {
         if let Some(v) = token_string(&token, "VoiceName") {
             state.voice = v;
         }
-        elog!("SetObjectToken: voice={} assets={}", state.voice, assets.display());
+        if let Some(ms) = token_string(&token, "TailLeadMs").and_then(|s| s.trim().parse::<u64>().ok()) {
+            state.tail_lead = Duration::from_millis(ms);
+        }
+        elog!(
+            "SetObjectToken: voice={} assets={} tail_lead={} ms",
+            state.voice,
+            assets.display(),
+            state.tail_lead.as_millis()
+        );
         state.token = Some(token);
+        state.assets = assets.clone();
+        drop(state);
+        // Load and warm up the model in the background now, so the first
+        // Speak doesn't pay for it. Hosts create a new engine per voice
+        // object; the model is shared process-wide, so after the first time
+        // this returns immediately.
+        std::thread::spawn(move || {
+            let _ = shared_synth(&assets);
+        });
         Ok(())
     }
 
@@ -152,61 +184,300 @@ enum Frag {
     SilenceMs(u32),
 }
 
+/// One unit of output, in playback order.
+enum Item {
+    Silence(u32),
+    Speech { sentence: Sentence, src_offset: u32 },
+}
+
+type Chunk = anyhow::Result<Vec<f32>>;
+
+/// State shared between the SAPI thread and the synthesis worker.
+struct Shared {
+    cancel: AtomicBool,
+    rate_adj: AtomicI32,
+    /// Lets the SAPI thread abort an in-flight inference on stop/purge.
+    run_opts: Option<ort::session::RunOptions>,
+}
+
+impl Shared {
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(o) = &self.run_opts {
+            let _ = o.terminate();
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+}
+
+/// SAPI rate −10..10 → Kokoro speed 0.5×..2×.
+fn speed_for(rate_adj: i32) -> f32 {
+    2f32.powf(rate_adj as f32 / 10.0).clamp(0.5, 2.0)
+}
+
 impl KokoroEngine_Impl {
     fn speak_inner(&self, ptextfraglist: *const SPVTEXTFRAG, site: &ISpTTSEngineSite) -> Result<()> {
+        let t_start = Instant::now();
         let frags = unsafe { collect_frags(ptextfraglist) };
-        let mut rate_adj = unsafe { site.GetRate().unwrap_or(0) };
-        let mut volume = unsafe { site.GetVolume().unwrap_or(100) };
-        let mut bytes_written: u64 = 0;
+        let rate_adj = unsafe { site.GetRate().unwrap_or(0) };
+        let volume = unsafe { site.GetVolume().unwrap_or(100) };
 
-        let mut state = self.state.lock().unwrap();
-        ensure_synth(&mut state);
-        let voice = state.voice.clone();
-        let mut pacer = Pacer::new();
+        let (voice, assets, tail_lead, gap) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.voice.clone(),
+                state.assets.clone(),
+                state.tail_lead,
+                state.last_speak_end,
+            )
+        };
 
+        let mut items = Vec::new();
+        let mut chars = 0usize;
+        let mut n_chunks = 0usize;
         for frag in frags {
             match frag {
-                Frag::SilenceMs(ms) => {
-                    let buf = vec![0u8; (ms * BYTES_PER_MS) as usize & !1];
-                    if !write_pcm(site, &buf, &mut bytes_written, &mut pacer) {
-                        return Ok(());
-                    }
-                }
+                Frag::SilenceMs(ms) => items.push(Item::Silence(ms)),
                 Frag::Text { utf16, src_offset } => {
                     let text = String::from_utf16_lossy(&utf16);
-                    for sentence in split_sentences(&text) {
-                        let actions = unsafe { site.GetActions() };
-                        if actions & SPVES_ABORT != 0 {
-                            elog!("abort requested");
-                            return Ok(());
-                        }
-                        if actions & SPVES_RATE != 0 {
-                            rate_adj = unsafe { site.GetRate().unwrap_or(rate_adj) };
-                        }
-                        if actions & SPVES_VOLUME != 0 {
-                            volume = unsafe { site.GetVolume().unwrap_or(volume) };
-                        }
-                        let speed = 2f32.powf(rate_adj as f32 / 10.0).clamp(0.5, 2.0);
-
-                        let samples = match synthesize(&mut state, &sentence.text, &voice, speed) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                elog!("synthesis failed: {e:#}");
-                                continue;
-                            }
-                        };
-                        let pcm = to_pcm16(&samples, volume as f32 / 100.0);
-
-                        emit_word_boundaries(site, &sentence, src_offset, bytes_written, pcm.len());
-                        if !write_pcm(site, &pcm, &mut bytes_written, &mut pacer) {
-                            return Ok(());
-                        }
+                    chars += text.chars().count();
+                    // Only the first chunk of the call gets the short clause
+                    // limit: it's the one the listener is waiting on.
+                    for sentence in split_sentences(&text, n_chunks == 0) {
+                        n_chunks += 1;
+                        items.push(Item::Speech { sentence, src_offset });
                     }
                 }
             }
         }
-        Ok(())
+        elog!(
+            "Speak: {chars} chars, {n_chunks} chunks, rate={rate_adj}, gap since last Speak: {}",
+            gap.map(|(t, _)| format!("{} ms", t.elapsed().as_millis()))
+                .unwrap_or_else(|| "n/a".into())
+        );
+
+        let shared = Arc::new(Shared {
+            cancel: AtomicBool::new(false),
+            rate_adj: AtomicI32::new(rate_adj),
+            run_opts: ort::session::RunOptions::new().ok(),
+        });
+        let texts: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Speech { sentence, .. } => Some(sentence.text.clone()),
+                Item::Silence(_) => None,
+            })
+            .collect();
+        let rx = spawn_producer(texts, voice, assets, shared.clone());
+
+        let mut queued_at_end = None;
+        let prev_end = gap.and_then(|(t, q)| q.map(|q| (t, q)));
+        let result = play(site, items, &rx, &shared, volume, tail_lead, t_start, prev_end, &mut queued_at_end);
+        // Stop the worker (if still running) without waiting for it: a new
+        // Speak after a purge should not sit behind the old one's inference.
+        shared.cancel();
+        drop(rx);
+        self.state.lock().unwrap().last_speak_end = Some((Instant::now(), queued_at_end));
+        elog!(
+            "Speak done after {} ms ({} ms of audio still queued)",
+            t_start.elapsed().as_millis(),
+            queued_at_end.map(|d| d.as_millis()).unwrap_or(0)
+        );
+        result
     }
+}
+
+/// The consumer side: receive synthesized chunks in order and write them to
+/// SAPI, paced to real time. `prev_end` = when the previous Speak returned
+/// and how much audio it left queued, to detect a gap between calls.
+#[allow(clippy::too_many_arguments)]
+fn play(
+    site: &ISpTTSEngineSite,
+    items: Vec<Item>,
+    rx: &Receiver<Chunk>,
+    shared: &Shared,
+    mut volume: u16,
+    tail_lead: Duration,
+    t_start: Instant,
+    prev_end: Option<(Instant, Duration)>,
+    queued_at_end: &mut Option<Duration>,
+) -> Result<()> {
+    let mut bytes_written: u64 = 0;
+    let mut pacer = Pacer::new();
+    let mut first_audio = true;
+    let last_speech = items.iter().rposition(|i| matches!(i, Item::Speech { .. }));
+
+    for (idx, item) in items.into_iter().enumerate() {
+        if Some(idx) == last_speech {
+            pacer.max_lead = tail_lead.max(MAX_LEAD);
+        }
+        match item {
+            Item::Silence(ms) => {
+                let buf = vec![0u8; (ms * BYTES_PER_MS) as usize & !1];
+                if !write_pcm(site, &buf, &mut bytes_written, &mut pacer) {
+                    return Ok(());
+                }
+            }
+            Item::Speech { sentence, src_offset } => {
+                let actions = unsafe { site.GetActions() };
+                if actions & SPVES_ABORT != 0 {
+                    elog!("abort requested");
+                    return Ok(());
+                }
+                if actions & SPVES_RATE != 0 {
+                    // Applies from the next chunk the worker starts.
+                    let r = unsafe { site.GetRate().unwrap_or(0) };
+                    shared.rate_adj.store(r, Ordering::SeqCst);
+                }
+                if actions & SPVES_VOLUME != 0 {
+                    volume = unsafe { site.GetVolume().unwrap_or(volume) };
+                }
+
+                // Audio still queued ahead of playback when we start waiting:
+                // if the chunk takes longer than that, the listener hears a gap.
+                let buffered = pacer.lead(bytes_written);
+                let wait_start = Instant::now();
+                let samples = match recv_abortable(site, rx) {
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => {
+                        elog!("synthesis failed: {e:#}");
+                        continue;
+                    }
+                    None => return Ok(()),
+                };
+                let waited = wait_start.elapsed();
+                if first_audio {
+                    first_audio = false;
+                    match prev_end {
+                        Some((t, queued)) if t.elapsed() > queued + Duration::from_millis(20) => elog!(
+                            "first audio after {} ms: ~{} ms gap after the previous Speak",
+                            t_start.elapsed().as_millis(),
+                            (t.elapsed() - queued).as_millis()
+                        ),
+                        _ => elog!("first audio after {} ms", t_start.elapsed().as_millis()),
+                    }
+                } else if waited > buffered + Duration::from_millis(20) {
+                    elog!(
+                        "UNDERRUN: waited {} ms for synthesis with {} ms buffered: ~{} ms gap",
+                        waited.as_millis(),
+                        buffered.as_millis(),
+                        (waited - buffered).as_millis()
+                    );
+                }
+                if waited > buffered {
+                    // Playback ran dry while we waited. Restart the clock so
+                    // the next writes don't burst to "catch up" (which would
+                    // buffer seconds of audio and make pause lag).
+                    pacer.reset();
+                }
+
+                let pcm = to_pcm16(trim_silence(&samples, sentence.mid_sentence), volume as f32 / 100.0);
+                emit_word_boundaries(site, &sentence, src_offset, bytes_written, pcm.len());
+                if !write_pcm(site, &pcm, &mut bytes_written, &mut pacer) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    *queued_at_end = Some(pacer.lead(bytes_written));
+    Ok(())
+}
+
+/// Wait for the next synthesized chunk, checking for abort every 50 ms.
+/// None = abort, or the worker is gone.
+fn recv_abortable(site: &ISpTTSEngineSite, rx: &Receiver<Chunk>) -> Option<Chunk> {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(r) => return Some(r),
+            Err(RecvTimeoutError::Timeout) => {
+                if unsafe { site.GetActions() } & SPVES_ABORT != 0 {
+                    elog!("abort requested while waiting for synthesis");
+                    return None;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Finished chunks the worker may queue ahead of playback. With one queued
+/// and one in progress the worker never idles while there is text left, which
+/// is all that matters when synthesis is near real time.
+const LOOKAHEAD: usize = 1;
+
+/// Synthesize `texts` in order on a worker thread. The worker stops when the
+/// receiver is dropped or `shared` is cancelled.
+fn spawn_producer(texts: Vec<String>, voice: String, assets: PathBuf, shared: Arc<Shared>) -> Receiver<Chunk> {
+    let (tx, rx) = sync_channel(LOOKAHEAD);
+    std::thread::spawn(move || {
+        let synth = shared_synth(&assets);
+        for text in texts {
+            if shared.cancelled() {
+                return;
+            }
+            let speed = speed_for(shared.rate_adj.load(Ordering::SeqCst));
+            let result = match &synth {
+                Some(s) => {
+                    // Another Speak's worker may still hold this briefly
+                    // while its terminated inference unwinds.
+                    let mut s = s.lock().unwrap_or_else(|e| e.into_inner());
+                    if shared.cancelled() {
+                        return;
+                    }
+                    s.synthesize_with(&text, &voice, speed, shared.run_opts.as_ref())
+                }
+                None => Ok(test_tone(&text)),
+            };
+            if shared.cancelled() || tx.send(result).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// The process-wide model. Loading takes seconds (and ~400 MB), and hosts
+/// create a fresh engine object per voice, so it is loaded once and shared.
+/// Concurrent callers block until the first load finishes. None = assets
+/// missing; the engine then falls back to a test tone.
+fn shared_synth(assets: &Path) -> Option<Arc<Mutex<Synth>>> {
+    static SYNTH: OnceLock<Option<Arc<Mutex<Synth>>>> = OnceLock::new();
+    SYNTH
+        .get_or_init(|| {
+            let t = Instant::now();
+            crate::synth::exempt_thread_from_power_throttling();
+            match Synth::new(assets) {
+                Ok(mut s) => {
+                    // The very first inference pays one-off setup costs; take
+                    // them here. (Measured: a sentence-length warm-up costs
+                    // ~6 s and doesn't make the next run any faster, so keep
+                    // it tiny.)
+                    if let Err(e) = s.synthesize("Hello there.", "af_heart", 1.0) {
+                        elog!("warm-up failed: {e:#}");
+                    }
+                    elog!("synth ready (load + warm-up) in {} ms", t.elapsed().as_millis());
+                    Some(Arc::new(Mutex::new(s)))
+                }
+                Err(e) => {
+                    elog!("Synth init failed ({e:#}); falling back to test tone. Run setup.exe install.");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// Fallback so the COM/SAPI plumbing can be smoke-tested without assets:
+/// a 440 Hz tone, ~80 ms per word.
+fn test_tone(text: &str) -> Vec<f32> {
+    let words = text.split_whitespace().count().max(1);
+    let n = words * 80 * SAMPLE_RATE as usize / 1000;
+    (0..n)
+        .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.25)
+        .collect()
 }
 
 /// ~100 ms of audio per Write. Small chunks give us a GetActions check every
@@ -219,42 +490,84 @@ const CHUNK_BYTES: usize = (SAMPLE_RATE as usize / 10) * 2;
 /// late, at the end of the sentence). Since we synthesize much faster than
 /// real-time, unthrottled writes buffer the whole sentence and pause feels
 /// broken. Pacing writes to playback speed + this lead caps the pause delay.
-const MAX_LEAD: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_LEAD: Duration = Duration::from_millis(250);
+
+/// Lead allowed while writing the last chunk of a Speak call. Readers often
+/// issue one Speak per sentence, and SAPI only hands us the next sentence
+/// once this Speak returns — so with a 250 ms lead the next sentence's
+/// synthesis (1–2 s) is pure silence. Running further ahead on the final
+/// chunk lets Speak return early and the next one synthesize while this one
+/// is still playing. The cost: an ISpVoice::Pause during the last moments of
+/// a call takes up to this long to be heard (stop/purge is still immediate).
+/// Overridable per voice with the `TailLeadMs` token value.
+const DEFAULT_TAIL_LEAD_MS: u32 = 1500;
 
 /// Tracks wall-clock vs written audio so writes stay ~MAX_LEAD ahead of
-/// playback. The clock starts at the first write.
+/// playback. The clock starts at the first write (and restarts after an
+/// underrun, from the position written so far).
 struct Pacer {
-    start: Option<std::time::Instant>,
+    start: Option<Instant>,
+    /// Byte position the clock (re)started at.
+    origin: u64,
+    reset_pending: bool,
+    max_lead: Duration,
 }
 
 impl Pacer {
     fn new() -> Self {
-        Self { start: None }
+        Self {
+            start: None,
+            origin: 0,
+            reset_pending: false,
+            max_lead: MAX_LEAD,
+        }
+    }
+
+    fn audio_since_origin(&self, bytes_written: u64) -> Duration {
+        Duration::from_secs_f64(bytes_written.saturating_sub(self.origin) as f64 / (SAMPLE_RATE * 2) as f64)
     }
 
     /// Sleep until `bytes_written` is at most MAX_LEAD ahead of playback.
     /// Returns false on abort.
     fn throttle(&mut self, site: &ISpTTSEngineSite, bytes_written: u64) -> bool {
-        let start = self.start.get_or_insert_with(std::time::Instant::now);
-        let audio_pos =
-            std::time::Duration::from_secs_f64(bytes_written as f64 / (SAMPLE_RATE * 2) as f64);
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+            self.origin = if self.reset_pending { bytes_written } else { 0 };
+            self.reset_pending = false;
+        }
+        let start = self.start.unwrap();
+        let audio_pos = self.audio_since_origin(bytes_written);
         loop {
             if unsafe { site.GetActions() } & SPVES_ABORT != 0 {
                 elog!("abort requested while pacing");
                 return false;
             }
             let elapsed = start.elapsed();
-            if audio_pos <= elapsed + MAX_LEAD {
+            if audio_pos <= elapsed + self.max_lead {
                 return true;
             }
-            std::thread::sleep((audio_pos - elapsed - MAX_LEAD).min(std::time::Duration::from_millis(50)));
+            std::thread::sleep((audio_pos - elapsed - self.max_lead).min(Duration::from_millis(50)));
         }
+    }
+
+    /// How much written audio has not been played yet (approximately).
+    fn lead(&self, bytes_written: u64) -> Duration {
+        match self.start {
+            Some(start) => self.audio_since_origin(bytes_written).saturating_sub(start.elapsed()),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Playback ran dry: the next write restarts the clock at that position.
+    fn reset(&mut self) {
+        self.start = None;
+        self.reset_pending = true;
     }
 
     /// A Write that blocked for long means SAPI held us (pause, or a full
     /// device buffer): playback did not consume audio during that time, so
     /// shift the clock to keep the lead at MAX_LEAD instead of bursting.
-    fn on_blocked_write(&mut self, blocked_for: std::time::Duration) {
+    fn on_blocked_write(&mut self, blocked_for: Duration) {
         if let Some(start) = self.start.as_mut() {
             *start += blocked_for;
         }
@@ -271,47 +584,18 @@ fn write_pcm(site: &ISpTTSEngineSite, data: &[u8], bytes_written: &mut u64, pace
             elog!("abort requested mid-write");
             return false;
         }
-        let before = std::time::Instant::now();
+        let before = Instant::now();
         if let Err(e) = unsafe { site.Write(chunk.as_ptr() as *const c_void, chunk.len() as u32) } {
             elog!("write interrupted (purge): {e}");
             return false;
         }
         let blocked = before.elapsed();
-        if blocked > std::time::Duration::from_millis(250) {
+        if blocked > Duration::from_millis(250) {
             pacer.on_blocked_write(blocked);
         }
         *bytes_written += chunk.len() as u64;
     }
     true
-}
-
-fn ensure_synth(state: &mut EngineState) {
-    if state.synth.is_some() || state.synth_failed {
-        return;
-    }
-    let assets = crate::config::assets_dir(None);
-    match Synth::new(&assets) {
-        Ok(s) => state.synth = Some(s),
-        Err(e) => {
-            elog!("Synth init failed ({e:#}) — falling back to test tone. Run scripts/download-assets.ps1.");
-            state.synth_failed = true;
-        }
-    }
-}
-
-fn synthesize(state: &mut EngineState, text: &str, voice: &str, speed: f32) -> anyhow::Result<Vec<f32>> {
-    match state.synth.as_mut() {
-        Some(s) => s.synthesize(text, voice, speed),
-        // Fallback so the COM/SAPI plumbing can be smoke-tested without assets:
-        // a 440 Hz tone, ~80 ms per word.
-        None => {
-            let words = text.split_whitespace().count().max(1);
-            let n = words * 80 * SAMPLE_RATE as usize / 1000;
-            Ok((0..n)
-                .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.25)
-                .collect())
-        }
-    }
 }
 
 unsafe fn collect_frags(mut cur: *const SPVTEXTFRAG) -> Vec<Frag> {
@@ -340,32 +624,74 @@ struct Sentence {
     /// (utf16_offset_in_frag, utf16_len, char_start_in_sentence) per word
     words: Vec<(u32, u32, usize)>,
     char_len: usize,
+    /// Split at a clause break (or the length limit), not a sentence end:
+    /// the pause after it should be short.
+    mid_sentence: bool,
 }
 
-/// Split on sentence-final punctuation, keeping the terminator with the
-/// sentence (Kokoro uses it for prosody). Tracks UTF-16 offsets for events.
-fn split_sentences(text: &str) -> Vec<Sentence> {
-    let mut sentences = Vec::new();
-    let mut start_c = 0usize; // char index of current sentence start
+/// A clause break (comma, dash) ends a chunk once the chunk has at least this
+/// many chars. Synthesis runs near real time on laptop CPUs, so a chunk's
+/// length is directly how long playback waits before it can start. Kokoro
+/// gets the comma as the chunk's final token, so it keeps a continuation
+/// intonation rather than a sentence-final drop.
+const CLAUSE_MIN_CHARS: usize = 80;
+/// Same, for the first chunk of a Speak call: the one the listener waits on.
+const FIRST_CLAUSE_MIN_CHARS: usize = 25;
+const SECOND_CLAUSE_MIN_CHARS: usize = 30;
+/// Never split off a sentence tail shorter than this; it sounds clipped.
+const MIN_TAIL_CHARS: usize = 15;
+/// No punctuation at all for this long: split at a space. Keeps chunks well
+/// under Kokoro's 510-token context, which would otherwise cut the audio off.
+const MAX_CHUNK_CHARS: usize = 250;
+
+fn is_terminator(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '…' | ';' | ':')
+}
+
+/// Split into chunks on sentence-final punctuation, keeping the terminator
+/// with the chunk (Kokoro uses it for prosody); long sentences are split
+/// further at clause breaks. Tracks UTF-16 offsets for events.
+fn split_sentences(text: &str, first_of_call: bool) -> Vec<Sentence> {
     let chars: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
+    let mut sentences = Vec::new();
+    let mut start_c = 0usize; // char index of the current chunk's start
+    for i in 0..chars.len() {
         let c = chars[i];
-        let is_end = matches!(c, '.' | '!' | '?' | '…' | ';' | ':');
-        if is_end || i == chars.len() - 1 {
+        let len = i + 1 - start_c;
+        // Grow chunks gradually at the start of a call: chunk N+1 is
+        // synthesized while chunk N plays, so a short chunk followed by a
+        // long one would run dry.
+        let min_clause = match (first_of_call, sentences.len()) {
+            (true, 0) => FIRST_CLAUSE_MIN_CHARS,
+            (true, 1) => SECOND_CLAUSE_MIN_CHARS,
+            _ => CLAUSE_MIN_CHARS,
+        };
+        let clause_break = matches!(c, ',' | '—' | '–') && len >= min_clause && {
+            // Alphanumeric chars left in this sentence after the break.
+            let tail = chars[i + 1..]
+                .iter()
+                .take_while(|&&c| !is_terminator(c))
+                .filter(|c| c.is_alphanumeric())
+                .count();
+            tail >= MIN_TAIL_CHARS
+        };
+        let is_end = is_terminator(c)
+            || i == chars.len() - 1
+            || clause_break
+            || (c.is_whitespace() && len >= MAX_CHUNK_CHARS);
+        if is_end {
             let end = i + 1;
-            let s: String = chars[start_c..end].iter().collect();
-            if s.trim().chars().any(|c| c.is_alphanumeric()) {
-                sentences.push(make_sentence(&chars, start_c, end));
+            let mid_sentence = !is_terminator(c) && i != chars.len() - 1;
+            if chars[start_c..end].iter().any(|c| c.is_alphanumeric()) {
+                sentences.push(make_sentence(&chars, start_c, end, mid_sentence));
             }
             start_c = end;
         }
-        i += 1;
     }
     sentences
 }
 
-fn make_sentence(chars: &[char], start: usize, end: usize) -> Sentence {
+fn make_sentence(chars: &[char], start: usize, end: usize, mid_sentence: bool) -> Sentence {
     // utf16 offset of `start` within the fragment
     let utf16_before: usize = chars[..start].iter().map(|c| c.len_utf16()).sum();
     let mut words = Vec::new();
@@ -391,7 +717,31 @@ fn make_sentence(chars: &[char], start: usize, end: usize) -> Sentence {
         text: chars[start..end].iter().collect::<String>().trim().to_string(),
         words,
         char_len: end - start,
+        mid_sentence,
     }
+}
+
+/// Kokoro pads every chunk with ~300 ms of leading and ~450 ms of trailing
+/// silence (measured). Between sentences the trailing pad is the natural
+/// pause, but the leading pad only adds to it, and to any wait for synthesis
+/// between Speak calls; at a clause split both pads would make a ~750 ms
+/// stall mid-sentence. Keep a little of each so onsets aren't clipped.
+const KEEP_LEAD_MS: usize = 60;
+const KEEP_TAIL_MID_SENTENCE_MS: usize = 150;
+const SILENCE_THRESHOLD: f32 = 0.01;
+
+fn trim_silence(samples: &[f32], mid_sentence: bool) -> &[f32] {
+    let per_ms = SAMPLE_RATE as usize / 1000;
+    let Some(first) = samples.iter().position(|v| v.abs() > SILENCE_THRESHOLD) else {
+        return samples;
+    };
+    let start = first.saturating_sub(KEEP_LEAD_MS * per_ms);
+    let mut end = samples.len();
+    if mid_sentence {
+        let last = samples.iter().rposition(|v| v.abs() > SILENCE_THRESHOLD).unwrap_or(end);
+        end = (last + 1 + KEEP_TAIL_MID_SENTENCE_MS * per_ms).min(samples.len());
+    }
+    &samples[start..end]
 }
 
 /// Queue SPEI_WORD_BOUNDARY events for a sentence. Audio offsets are estimated
@@ -436,4 +786,63 @@ fn to_pcm16(samples: &[f32], gain: f32) -> Vec<u8> {
         out.extend_from_slice(&((v * i16::MAX as f32) as i16).to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(s: &str, first: bool) -> Vec<String> {
+        split_sentences(s, first).into_iter().map(|s| s.text).collect()
+    }
+
+    #[test]
+    fn splits_on_sentence_terminators() {
+        assert_eq!(texts("One two. Three four! Five?", false), ["One two.", "Three four!", "Five?"]);
+    }
+
+    #[test]
+    fn first_chunk_splits_early_at_a_comma() {
+        let s = "Now the earth was formless and empty, darkness was over the surface of the deep.";
+        assert_eq!(
+            texts(s, true),
+            ["Now the earth was formless and empty,", "darkness was over the surface of the deep."]
+        );
+        // Not the first chunk of the call: 37 chars is below the clause limit.
+        assert_eq!(texts(s, false), [s]);
+    }
+
+    #[test]
+    fn marks_clause_splits_as_mid_sentence() {
+        let s = "Now the earth was formless and empty, darkness was over the surface of the deep. Then";
+        let flags: Vec<bool> = split_sentences(s, true).iter().map(|c| c.mid_sentence).collect();
+        assert_eq!(flags, [true, false, false]);
+    }
+
+    #[test]
+    fn trims_leading_pad_always_and_trailing_pad_only_mid_sentence() {
+        let ms = |n: usize| n * SAMPLE_RATE as usize / 1000;
+        let mut audio = vec![0.0f32; ms(300)];
+        audio.extend(std::iter::repeat(0.5).take(ms(1000)));
+        audio.extend(std::iter::repeat(0.0).take(ms(450)));
+        assert_eq!(trim_silence(&audio, false).len(), ms(60) + ms(1000) + ms(450));
+        assert_eq!(trim_silence(&audio, true).len(), ms(60) + ms(1000) + ms(150));
+    }
+
+    #[test]
+    fn keeps_short_tail_attached() {
+        assert_eq!(
+            texts("Now the earth was formless and empty, he said.", true),
+            ["Now the earth was formless and empty, he said."]
+        );
+    }
+
+    #[test]
+    fn word_offsets_survive_clause_split() {
+        let s = "Now the earth was formless and empty, darkness was over the surface of the deep.";
+        let chunks = split_sentences(s, true);
+        let (off, len, _) = chunks[1].words[0];
+        let utf16: Vec<u16> = s.encode_utf16().collect();
+        assert_eq!(String::from_utf16_lossy(&utf16[off as usize..(off + len) as usize]), "darkness");
+    }
 }

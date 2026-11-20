@@ -8,8 +8,10 @@
 pub mod config;
 mod engine;
 mod g2p;
-mod logger;
-mod synth;
+#[doc(hidden)]
+pub mod logger;
+#[doc(hidden)]
+pub mod synth;
 mod tokenizer;
 mod voices;
 
