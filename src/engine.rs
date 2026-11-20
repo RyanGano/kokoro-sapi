@@ -375,8 +375,8 @@ fn play(
                 }
 
                 let pcm = to_pcm16(trim_silence(&samples, sentence.mid_sentence), volume as f32 / 100.0);
-                emit_word_boundaries(site, &sentence, src_offset, bytes_written, pcm.len());
-                if !write_pcm(site, &pcm, &mut bytes_written, &mut pacer) {
+                let events = word_boundaries(&sentence, src_offset, pcm.len());
+                if !write_with_events(site, &pcm, events, &mut bytes_written, &mut pacer) {
                     return Ok(());
                 }
             }
@@ -744,39 +744,52 @@ fn trim_silence(samples: &[f32], mid_sentence: bool) -> &[f32] {
     &samples[start..end]
 }
 
-/// Queue SPEI_WORD_BOUNDARY events for a sentence. Audio offsets are estimated
-/// proportionally over the sentence's PCM bytes — SAPI fires each event when
-/// playback reaches its offset, which is what drives word highlighting in
-/// Chrome's reading mode and other readers.
-fn emit_word_boundaries(
-    site: &ISpTTSEngineSite,
-    sentence: &Sentence,
-    src_offset: u32,
-    base_bytes: u64,
-    pcm_len: usize,
-) {
-    if sentence.words.is_empty() || sentence.char_len == 0 {
-        return;
+/// SPEI_WORD_BOUNDARY events for a sentence, each paired with its byte offset
+/// into the sentence's PCM (estimated proportionally to character position).
+/// These drive word highlighting in Chrome's reading mode, Logos and others.
+fn word_boundaries(sentence: &Sentence, src_offset: u32, pcm_len: usize) -> Vec<(usize, SPEVENT)> {
+    if sentence.char_len == 0 {
+        return Vec::new();
     }
-    let events: Vec<SPEVENT> = sentence
+    sentence
         .words
         .iter()
         .map(|&(u16_off, u16_len, char_start)| {
-            let audio_off = base_bytes + (pcm_len * char_start / sentence.char_len) as u64 & !1;
+            let pcm_off = (pcm_len * char_start / sentence.char_len) & !1;
             let mut ev: SPEVENT = unsafe { std::mem::zeroed() };
             ev._bitfield = SPEI_WORD_BOUNDARY.0; // eEventId:16 | elParamType:16 (UNDEFINED=0)
-            ev.ulStreamNum = 0;
-            ev.ullAudioStreamOffset = audio_off;
             ev.wParam = WPARAM(u16_len as usize);
             ev.lParam = LPARAM((src_offset + u16_off) as isize);
-            ev
+            (pcm_off, ev)
         })
-        .collect();
-    unsafe {
-        if let Err(e) = site.AddEvents(events.as_ptr(), events.len() as u32) {
+        .collect()
+}
+
+/// Write a sentence's audio, adding each event right before the audio it
+/// belongs to. Native SAPI honours ullAudioStreamOffset, but System.Speech
+/// (used by .NET hosts) fires an event at the write position it was added at:
+/// queuing a whole sentence's events up front made every word fire at once
+/// when the sentence started. Returns false on abort, like write_pcm.
+fn write_with_events(
+    site: &ISpTTSEngineSite,
+    pcm: &[u8],
+    events: Vec<(usize, SPEVENT)>,
+    bytes_written: &mut u64,
+    pacer: &mut Pacer,
+) -> bool {
+    let mut pos = 0;
+    for (off, mut ev) in events {
+        let off = off.clamp(pos, pcm.len());
+        if !write_pcm(site, &pcm[pos..off], bytes_written, pacer) {
+            return false;
+        }
+        pos = off;
+        ev.ullAudioStreamOffset = *bytes_written;
+        if let Err(e) = unsafe { site.AddEvents(&ev, 1) } {
             elog!("AddEvents failed: {e}");
         }
     }
+    write_pcm(site, &pcm[pos..], bytes_written, pacer)
 }
 
 fn to_pcm16(samples: &[f32], gain: f32) -> Vec<u8> {
@@ -835,6 +848,13 @@ mod tests {
             texts("Now the earth was formless and empty, he said.", true),
             ["Now the earth was formless and empty, he said."]
         );
+    }
+
+    #[test]
+    fn word_boundaries_spread_across_the_audio_in_order() {
+        let s = &split_sentences("In the beginning God created", false)[0];
+        let offs: Vec<usize> = word_boundaries(s, 0, 2800).iter().map(|(o, _)| *o).collect();
+        assert_eq!(offs, [0, 300, 700, 1700, 2100]);
     }
 
     #[test]
